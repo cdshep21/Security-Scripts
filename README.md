@@ -13,9 +13,9 @@ All scripts are stored in the `scripts/` directory:
 | Script                         | Language   | Description                                                                                                          |
 | ------------------------------ | ---------- | -------------------------------------------------------------------------------------------------------------------- |
 | `cve_query.py`                 | Python     | Queries Tenable Security Center for CVE-related data, extracts plugin and asset info, and generates an Excel report. |
-| `install_nessus_agent.sh`      | Bash       | Automates installation and registration of Nessus Agents on RHEL-based systems.                                      |
-| `firewall_data_pull.py`        | Python     | Pulls and filters firewall IP address data for audit or cleanup purposes.                                            |
-| `download_tenable_reports.ps1` | PowerShell | Downloads vulnerability reports from Tenable.sc for compliance and offline review.                                   |
+| `nessus_rhel.sh`      | Bash       | Automates installation and registration of Nessus Agents on RHEL-based systems.                                      |
+| `Firewall_Rule_Parser.py`        | Python     | Pulls and filters firewall IP address data for audit or cleanup purposes.                                            |
+| `tenable_reports.ps1` | PowerShell | Downloads vulnerability reports from Tenable.sc for compliance and offline review.                                   |
 
 <!-- Add more rows as you add more scripts -->
 
