@@ -1,9 +1,9 @@
 #!/bin/bash
- 
+
 ######################################################################################################################
 # Nessus Agent Installation Script (RHEL / Oracle Linux)
 # Author: Corderius Shepherd
-# Version: 1.16
+# Version: 1.17
 # Last Updated: 11-APR-2025
 #
 # DESCRIPTION:
@@ -12,16 +12,17 @@
 # If the agent is outdated, it is replaced with a provided RPM.
 # Includes retry logic for unlink and link commands.
 ########################################################################################################################
- 
+
+# Exit on error, undefined variables, and pipe failures
+set -euo pipefail
+
 # CONFIGURATION
 MANAGER="nessus-manager.example.com"
 MANAGER_IP="321.45.79.23"
-LINKING_KEY="base64encodedlinkingkeytoobfuscatetheactualkey=="
+LINKING_KEY="REPLACE_WITH_BASE64_ENCODED_KEY"
 GROUP="'RHEL Agents'"
 REQUIRED_VERSION="10.8.3"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOGFILE="$SCRIPT_DIR/nessus_agent_install.log"
- 
+
 # CHILD NODE DNS MAPPINGS
 declare -A NODES=(
     ["nm424"]="321.45.79.24"
@@ -30,163 +31,301 @@ declare -A NODES=(
     ["nm427"]="321.45.79.27"
     ["nm428"]="321.45.79.28"
 )
- 
+
+# Constants
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly LOGFILE="$SCRIPT_DIR/nessus_agent_install.log"
+readonly BACKUP_DIR="$SCRIPT_DIR/backups"
+readonly MAX_RETRIES=3
+readonly RETRY_DELAY=2
+
+# Logging levels
+readonly LOG_LEVEL_DEBUG=0
+readonly LOG_LEVEL_INFO=1
+readonly LOG_LEVEL_WARNING=2
+readonly LOG_LEVEL_ERROR=3
+
+# Current log level
+LOG_LEVEL=${LOG_LEVEL:-$LOG_LEVEL_INFO}
+
+# Function to log messages with different levels
 log_message() {
-    echo "$(date +'%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOGFILE"
+    local level=$1
+    local message=$2
+    local timestamp=$(date +'%Y-%m-%d %H:%M:%S')
+    local level_str
+
+    case $level in
+        $LOG_LEVEL_DEBUG) level_str="DEBUG" ;;
+        $LOG_LEVEL_INFO) level_str="INFO" ;;
+        $LOG_LEVEL_WARNING) level_str="WARNING" ;;
+        $LOG_LEVEL_ERROR) level_str="ERROR" ;;
+        *) level_str="UNKNOWN" ;;
+    esac
+
+    if [[ $level -ge $LOG_LEVEL ]]; then
+        echo "$timestamp [$level_str] $message" | tee -a "$LOGFILE"
+    fi
 }
- 
+
+# Function to validate the linking key
+validate_linking_key() {
+    local key=$1
+    if [[ -z "$key" ]]; then
+        log_message $LOG_LEVEL_ERROR "Linking key is empty"
+        return 1
+    fi
+    
+    # Check if the key is valid base64
+    if ! echo "$key" | base64 -d &>/dev/null; then
+        log_message $LOG_LEVEL_ERROR "Invalid base64 encoding in linking key"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Function to backup files
+backup_file() {
+    local file=$1
+    local backup_path="$BACKUP_DIR/$(basename "$file").$(date +%Y%m%d_%H%M%S)"
+    
+    if [[ -f "$file" ]]; then
+        mkdir -p "$BACKUP_DIR"
+        cp -p "$file" "$backup_path"
+        log_message $LOG_LEVEL_INFO "Backed up $file to $backup_path"
+    fi
+}
+
+# Function to restore from backup
+restore_from_backup() {
+    local file=$1
+    local backup_path="$BACKUP_DIR/$(basename "$file").$(ls -t "$BACKUP_DIR/$(basename "$file")."* 2>/dev/null | head -n1)"
+    
+    if [[ -f "$backup_path" ]]; then
+        cp -p "$backup_path" "$file"
+        log_message $LOG_LEVEL_INFO "Restored $file from backup"
+    fi
+}
+
+# Function to verify RPM integrity
+verify_rpm() {
+    local rpm_file=$1
+    if ! rpm -K "$rpm_file" &>/dev/null; then
+        log_message $LOG_LEVEL_ERROR "RPM integrity check failed: $rpm_file"
+        return 1
+    fi
+    return 0
+}
+
+# Function to retry commands with exponential backoff
 retry_command() {
-    local CMD="$1"
-    local MAX_RETRIES=3
-    local COUNT=0
-    local SUCCESS=false
- 
-    while [[ $COUNT -lt $MAX_RETRIES ]]; do
-        eval "$CMD"
-        if [[ $? -eq 0 ]]; then
-            SUCCESS=true
+    local cmd=$1
+    local count=0
+    local success=false
+    local delay=$RETRY_DELAY
+
+    while [[ $count -lt $MAX_RETRIES ]]; do
+        if eval "$cmd"; then
+            success=true
             break
         else
-            log_message "Attempt $((COUNT+1)) failed for: $CMD"
-            ((COUNT++))
-            sleep 2
+            log_message $LOG_LEVEL_WARNING "Attempt $((count+1)) failed for: $cmd"
+            ((count++))
+            sleep $delay
+            ((delay *= 2))
         fi
     done
- 
-    if [[ "$SUCCESS" == false ]]; then
-        log_message "Command failed after $MAX_RETRIES attempts: $CMD"
-        exit 1
+
+    if [[ "$success" == false ]]; then
+        log_message $LOG_LEVEL_ERROR "Command failed after $MAX_RETRIES attempts: $cmd"
+        return 1
     fi
+    return 0
 }
- 
-cleanup() {
-    log_message "Cleaning up temporary files..."
-}
-trap cleanup EXIT
- 
-# === 1. VALIDATE BASELINE REQUIREMENTS ===
-if [[ $EUID -ne 0 ]]; then
-    echo "This script must be run with sudo or as root. Exiting."
-    exit 1
-fi
- 
-for cmd in rpm systemctl grep tee getent; do
-    if ! command -v "$cmd" &>/dev/null; then
-        log_message "Error: Required command '$cmd' is missing."
-        exit 1
-    fi
-done
- 
-if [[ -z "$MANAGER" || -z "$LINKING_KEY" ]]; then
-    log_message "Error: Required variables MANAGER and LINKING_KEY are not set. Exiting."
-    exit 1
-fi
- 
-OS_VERSION=$(rpm --eval '%{rhel}')
-TARGET_ARCH=$(uname -m)
- 
-# === 2. CHECK IF NESSUS AGENT IS INSTALLED ===
-if ! rpm -q NessusAgent &>/dev/null; then
-    log_message "Nessus Agent is not currently installed. This server is out of scope. Exiting."
-    exit 1
-fi
- 
-INSTALLED_VERSION=$(rpm -q --queryformat '%{VERSION}' NessusAgent)
-log_message "Installed Nessus Agent version: $INSTALLED_VERSION"
- 
-# === 3. CHECK FOR VALID RPM FILE ===
-RPM_FILES=($(ls NessusAgent*.rpm 2>/dev/null))
-if [[ ${#RPM_FILES[@]} -eq 0 ]]; then
-    log_message "No RPM files found in current directory. Exiting."
-    exit 1
-fi
- 
-log_message "Found the following RPM files:"
-for RPM in "${RPM_FILES[@]}"; do
-    log_message "  - $RPM"
-    RPM_ARCH=$(echo "$RPM" | grep -oE 'x86_64|aarch64|arm64|ppc64le')
-    RPM_OS_VERSION=$(echo "$RPM" | grep -oE 'el7|el8|el9')
-    RPM_VERSION=$(echo "$RPM" | grep -oP 'NessusAgent-\K[0-9]+\.[0-9]+\.[0-9]+')
- 
-    if [[ "$RPM_ARCH" == "$TARGET_ARCH" && "$RPM_OS_VERSION" == "el$OS_VERSION" && "$RPM_VERSION" == "$REQUIRED_VERSION" ]]; then
-        MATCHING_RPM="$RPM"
-        break
-    fi
-    [[ "$RPM_ARCH" == "$TARGET_ARCH" ]] && MATCHED_ARCH=true
-    [[ "$RPM_OS_VERSION" == "el$OS_VERSION" ]] && MATCHED_OS=true
-    [[ "$RPM_VERSION" == "$REQUIRED_VERSION" ]] && MATCHED_VER=true
- 
-done
- 
-if [[ -z "$MATCHING_RPM" ]]; then
-    log_message "No matching RPM found that satisfies all conditions:"
-    [[ -z "$MATCHED_ARCH" ]] && log_message "- Missing RPM for architecture: $TARGET_ARCH"
-    [[ -z "$MATCHED_OS" ]] && log_message "- Missing RPM for OS version: el$OS_VERSION"
-    [[ -z "$MATCHED_VER" ]] && log_message "- Missing RPM for version: $REQUIRED_VERSION"
-    log_message "Exiting before making any changes."
-    exit 1
-fi
- 
-# === 4. CHECK LINK STATUS ===
-AGENT_STATUS_CMD=$(sudo /opt/nessus_agent/sbin/nessuscli agent status)
-if echo "$AGENT_STATUS_CMD" | grep -q -e "Linked to: None" -e "Not linked to a manager"; then
-    IS_LINKED=false
-else
-    IS_LINKED=true
-fi
- 
-# === 5. READY TO MAKE CHANGES ===
-if [[ "$INSTALLED_VERSION" != "$REQUIRED_VERSION" ]]; then
-    log_message "Unlinking agent..."
-    $IS_LINKED && retry_command "sudo /opt/nessus_agent/sbin/nessuscli agent unlink"
- 
-    log_message "Uninstalling old Nessus Agent version..."
-    sudo rpm -e NessusAgent # Add -vv for debugging
- 
-    log_message "Installing RPM: $MATCHING_RPM"
-    sudo rpm -i --force "$MATCHING_RPM" # add -v for debugging
-    sleep 10
-    sudo systemctl enable nessusagent
-    sudo systemctl start nessusagent
-else
-    log_message "Agent is up to date."
-fi
- 
-# === 6. DNS FIXES ===
-DNS_SUFFIX=$(grep -oP '(?<=search\s)[^\n]+' /etc/resolv.conf | awk '{print $1}')
-[[ -z "$DNS_SUFFIX" ]] && log_message "Warning: No DNS search suffix found in /etc/resolv.conf"
- 
-if ! getent hosts "$MANAGER" &>/dev/null; then
-    log_message "Adding $MANAGER to /etc/hosts"
-    echo "$MANAGER_IP $MANAGER" | sudo tee -a /etc/hosts
-fi
- 
-RESOLVED=false
-for NODE in "${!NODES[@]}"; do
-    if getent hosts "$NODE" &>/dev/null; then
-        RESOLVED=true
-        break
-    fi
-    log_message "Unresolved: $NODE"
-done
- 
-if [[ "$RESOLVED" == false ]]; then
-    log_message "No nodes resolved. Adding all to /etc/hosts..."
-    for NODE in "${!NODES[@]}"; do
-        echo "${NODES[$NODE]} $NODE" | sudo tee -a /etc/hosts
+
+# Function to check system requirements
+check_requirements() {
+    local missing_deps=()
+    
+    for cmd in rpm systemctl grep tee getent openssl; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing_deps+=("$cmd")
+        fi
     done
-fi
- 
-# === 7. LINK AGENT ===
-KEY=$(echo "$LINKING_KEY" | base64 -d)
-log_message "Linking Nessus Agent to manager..."
-retry_command "sudo /opt/nessus_agent/sbin/nessuscli agent link --host=\"$MANAGER\" --key=\"$KEY\" --port=8834 --groups=\"$GROUP\""
- 
-log_message "Nessus Agent status:"
-sudo /opt/nessus_agent/sbin/nessuscli agent status --show-uuid
-sudo /opt/nessus_agent/sbin/nessuscli -v
-log_message "Process is complete."
- 
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        log_message $LOG_LEVEL_ERROR "Missing required dependencies: ${missing_deps[*]}"
+        return 1
+    fi
+    
+    if [[ $EUID -ne 0 ]]; then
+        log_message $LOG_LEVEL_ERROR "This script must be run with sudo or as root"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Function to check and fix DNS resolution
+fix_dns() {
+    local manager=$1
+    local manager_ip=$2
+    local -n nodes=$3
+    
+    backup_file "/etc/hosts"
+    
+    # Check and fix manager resolution
+    if ! getent hosts "$manager" &>/dev/null; then
+        log_message $LOG_LEVEL_INFO "Adding $manager to /etc/hosts"
+        echo "$manager_ip $manager" | tee -a /etc/hosts
+    fi
+    
+    # Check and fix node resolution
+    local resolved=false
+    for node in "${!nodes[@]}"; do
+        if getent hosts "$node" &>/dev/null; then
+            resolved=true
+            break
+        fi
+        log_message $LOG_LEVEL_WARNING "Unresolved: $node"
+    done
+    
+    if [[ "$resolved" == false ]]; then
+        log_message $LOG_LEVEL_INFO "Adding all nodes to /etc/hosts"
+        for node in "${!nodes[@]}"; do
+            echo "${nodes[$node]} $node" | tee -a /etc/hosts
+        done
+    fi
+}
+
+# Function to manage Nessus agent
+manage_nessus_agent() {
+    local installed_version
+    local matching_rpm
+    
+    # Check if Nessus agent is installed
+    if ! rpm -q NessusAgent &>/dev/null; then
+        log_message $LOG_LEVEL_ERROR "Nessus Agent is not installed"
+        return 1
+    fi
+    
+    installed_version=$(rpm -q --queryformat '%{VERSION}' NessusAgent)
+    log_message $LOG_LEVEL_INFO "Installed Nessus Agent version: $installed_version"
+    
+    # Find matching RPM
+    local rpm_files=($(ls NessusAgent*.rpm 2>/dev/null))
+    if [[ ${#rpm_files[@]} -eq 0 ]]; then
+        log_message $LOG_LEVEL_ERROR "No RPM files found"
+        return 1
+    fi
+    
+    for rpm in "${rpm_files[@]}"; do
+        if verify_rpm "$rpm"; then
+            local rpm_arch=$(echo "$rpm" | grep -oE 'x86_64|aarch64|arm64|ppc64le')
+            local rpm_os_version=$(echo "$rpm" | grep -oE 'el7|el8|el9')
+            local rpm_version=$(echo "$rpm" | grep -oP 'NessusAgent-\K[0-9]+\.[0-9]+\.[0-9]+')
+            
+            if [[ "$rpm_arch" == "$(uname -m)" && 
+                  "$rpm_os_version" == "el$(rpm --eval '%{rhel}')" && 
+                  "$rpm_version" == "$REQUIRED_VERSION" ]]; then
+                matching_rpm="$rpm"
+                break
+            fi
+        fi
+    done
+    
+    if [[ -z "$matching_rpm" ]]; then
+        log_message $LOG_LEVEL_ERROR "No matching RPM found"
+        return 1
+    fi
+    
+    # Update if needed
+    if [[ "$installed_version" != "$REQUIRED_VERSION" ]]; then
+        log_message $LOG_LEVEL_INFO "Updating Nessus Agent..."
+        
+        # Unlink if needed
+        if systemctl is-active nessusagent &>/dev/null; then
+            retry_command "/opt/nessus_agent/sbin/nessuscli agent unlink"
+        fi
+        
+        # Stop service
+        systemctl stop nessusagent
+        
+        # Remove old version
+        rpm -e NessusAgent
+        
+        # Install new version
+        rpm -i --force "$matching_rpm"
+        
+        # Start service
+        systemctl enable nessusagent
+        systemctl start nessusagent
+        
+        # Wait for service to be ready
+        sleep 10
+    else
+        log_message $LOG_LEVEL_INFO "Nessus Agent is up to date"
+    fi
+    
+    return 0
+}
+
+# Main function
+main() {
+    log_message $LOG_LEVEL_INFO "Starting Nessus Agent installation/update process"
+    
+    # Check requirements
+    if ! check_requirements; then
+        exit 1
+    fi
+    
+    # Validate linking key
+    if ! validate_linking_key "$LINKING_KEY"; then
+        exit 1
+    fi
+    
+    # Fix DNS resolution
+    fix_dns "$MANAGER" "$MANAGER_IP" NODES
+    
+    # Manage Nessus agent
+    if ! manage_nessus_agent; then
+        log_message $LOG_LEVEL_ERROR "Failed to manage Nessus agent"
+        exit 1
+    fi
+    
+    # Link agent
+    local key=$(echo "$LINKING_KEY" | base64 -d)
+    if ! retry_command "/opt/nessus_agent/sbin/nessuscli agent link --host=\"$MANAGER\" --key=\"$key\" --port=8834 --groups=\"$GROUP\""; then
+        log_message $LOG_LEVEL_ERROR "Failed to link agent"
+        exit 1
+    fi
+    
+    # Verify installation
+    log_message $LOG_LEVEL_INFO "Nessus Agent status:"
+    /opt/nessus_agent/sbin/nessuscli agent status --show-uuid
+    /opt/nessus_agent/sbin/nessuscli -v
+    
+    log_message $LOG_LEVEL_INFO "Process completed successfully"
+}
+
+# Cleanup function
+cleanup() {
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        log_message $LOG_LEVEL_ERROR "Script failed with exit code $exit_code"
+        # Restore backups if needed
+        restore_from_backup "/etc/hosts"
+    fi
+    exit $exit_code
+}
+
+# Set up cleanup trap
+trap cleanup EXIT
+
+# Run main function
+main
+
 ######################################################################################################################
 # - Handle and store this script securely.
 # - Do not share with unauthorized personnel.
