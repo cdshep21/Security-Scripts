@@ -13,9 +13,48 @@ from openpyxl.utils import get_column_letter
 from cryptography.fernet import Fernet
 import urllib3
 import re
+from contextlib import contextmanager
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Uncomment to disable SSL warnings for self-signed certificates
 # urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("cve_query.log"),
+        logging.StreamHandler()
+    ]
+)
+
+# Configure requests session with retry strategy
+def create_session():
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+@contextmanager
+def safe_excel_workbook():
+    wb = None
+    try:
+        wb = openpyxl.Workbook()
+        yield wb
+    finally:
+        if wb:
+            try:
+                wb.close()
+            except Exception as e:
+                logging.error(f"Error closing workbook: {e}")
 
 # Returns the directory where the script is located
 def get_script_directory():
@@ -44,10 +83,10 @@ def decrypt_key(fernet, encrypted_key):
         raise
 
 # Queries Tenable.SC for plugin IDs associated with the specified CVE
-def get_plugins_for_cve(tenable_url, headers, cert_path, cve):
+def get_plugins_for_cve(tenable_url, headers, cert_path, cve, session):
     params = {"filterField": "xrefs", "op": "eq", "value": cve}
     try:
-        response = requests.get(f"{tenable_url}/rest/plugin", headers=headers, params=params, verify=cert_path)
+        response = session.get(f"{tenable_url}/rest/plugin", headers=headers, params=params, verify=cert_path)
         response.raise_for_status()
         plugins = response.json().get("response", {})
         if not plugins:
@@ -59,7 +98,7 @@ def get_plugins_for_cve(tenable_url, headers, cert_path, cve):
         return []
 
 # Creates a query in Tenable.SC using the given plugin IDs and query type
-def create_query(tenable_url, headers, cert_path, plugin_ids, cve, tool):
+def create_query(tenable_url, headers, cert_path, plugin_ids, cve, tool, session):
     payload = {
         'name': f'API Query for {cve} ({tool})',
         'description': f'This query was created via CVE_Query.py',
@@ -68,7 +107,7 @@ def create_query(tenable_url, headers, cert_path, plugin_ids, cve, tool):
         'filters': [{'filterName': 'pluginID', 'operator': '=', 'value': ",".join(plugin_ids)}]
     }
     try:
-        response = requests.post(f"{tenable_url}/rest/query", headers=headers, json=payload, verify=cert_path)
+        response = session.post(f"{tenable_url}/rest/query", headers=headers, json=payload, verify=cert_path)
         response.raise_for_status()
         return response.json()['response']['id']
     except requests.exceptions.RequestException as e:
@@ -76,10 +115,10 @@ def create_query(tenable_url, headers, cert_path, plugin_ids, cve, tool):
         return None
 
 # Downloads analysis results from a query ID
-def download_analysis(tenable_url, headers, query_id, cert_path):
+def download_analysis(tenable_url, headers, query_id, cert_path, session):
     payload = {'type': 'vuln', 'query': {'id': query_id}, 'sourceType': 'cumulative'}
     try:
-        response = requests.post(f"{tenable_url}/rest/analysis", headers=headers, json=payload, verify=cert_path)
+        response = session.post(f"{tenable_url}/rest/analysis", headers=headers, json=payload, verify=cert_path)
         response.raise_for_status()
         return response.json()['response']['results']
     except requests.exceptions.RequestException as e:
@@ -171,62 +210,84 @@ def main():
     config_path = os.path.join(script_dir, "config.json")
     cert_path = os.path.join(script_dir, "dod_chain.crt")
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
     if not os.path.exists(config_path) or not os.path.exists(cert_path):
         logging.error("Required config or certificate file not found.")
         sys.exit(1)
 
-    fernet = load_fernet_key()
-    config = load_config_file(config_path)
+    try:
+        fernet = load_fernet_key()
+        config = load_config_file(config_path)
+        
+        # Validate config structure
+        required_keys = ['url', 'encrypted_key']
+        for center_name, center_info in config.items():
+            if not all(key in center_info for key in required_keys):
+                raise ValueError(f"Invalid config structure for {center_name}")
 
-    # Prompt user for CVE with format validation and retry logic
-    MAX_ATTEMPTS = 3
-    for attempt in range(MAX_ATTEMPTS):
-        cve = input("Enter CVE (e.g., CVE-2023-1234): ").strip().upper()
-        if re.match(r"^CVE-\d{4}-\d{4,}$", cve):
-            logging.info(f"Valid CVE entered: {cve}")
-            break
+        # Prompt user for CVE with format validation and retry logic
+        MAX_ATTEMPTS = 3
+        for attempt in range(MAX_ATTEMPTS):
+            cve = input("Enter CVE (e.g., CVE-2023-1234): ").strip().upper()
+            if not cve or cve.isspace():
+                logging.warning("Empty CVE entered. Please try again.")
+                continue
+            if len(cve) > 20:  # Reasonable max length for CVE
+                logging.warning("CVE too long. Please try again.")
+                continue
+            if re.match(r"^CVE-\d{4}-\d{4,}$", cve):
+                logging.info(f"Valid CVE entered: {cve}")
+                break
+            else:
+                logging.warning("Invalid CVE format. Expected format: CVE-YYYY-NNNN")
         else:
-            logging.warning("Invalid CVE format. Expected format: CVE-YYYY-NNNN")
-    else:
-        logging.error("Maximum attempts exceeded. Exiting.")
-        sys.exit(1)
+            logging.error("Maximum attempts exceeded. Exiting.")
+            sys.exit(1)
 
-    # Get plugin IDs from first configured Security Center
-    first_center = next(iter(config.items()))
-    tenable_url = first_center[1]['url']
-    access_key, secret_key = decrypt_key(fernet, first_center[1]['encrypted_key']).split(";")
-    headers = {'x-apikey': f'accesskey={access_key}; secretkey={secret_key}', 'Content-Type': 'application/json'}
+        # Create session with retry strategy
+        session = create_session()
 
-    logging.info(f"Requesting plugin IDs for {cve} from {tenable_url}")
-    plugin_ids = get_plugins_for_cve(tenable_url, headers, cert_path, cve)
-    if not plugin_ids:
-        sys.exit(1)
-
-    wb = openpyxl.Workbook()
-    wb.remove(wb.active)
-
-    # Iterate through each configured Security Center and generate reports
-    for center_name, center_info in config.items():
-        url = center_info['url']
-        access_key, secret_key = decrypt_key(fernet, center_info['encrypted_key']).split(";")
+        # Get plugin IDs from first configured Security Center
+        first_center = next(iter(config.items()))
+        tenable_url = first_center[1]['url']
+        access_key, secret_key = decrypt_key(fernet, first_center[1]['encrypted_key']).split(";")
         headers = {'x-apikey': f'accesskey={access_key}; secretkey={secret_key}', 'Content-Type': 'application/json'}
 
-        logging.info(f"Creating IP summary query for {center_name}")
-        query_id_ip = create_query(url, headers, cert_path, plugin_ids, cve, "sumip")
-        data_ip = download_analysis(url, headers, query_id_ip, cert_path) if query_id_ip else []
-        add_ip_summary_sheet(wb, center_name, data_ip)
+        logging.info(f"Requesting plugin IDs for {cve} from {tenable_url}")
+        plugin_ids = get_plugins_for_cve(tenable_url, headers, cert_path, cve, session)
+        if not plugin_ids:
+            sys.exit(1)
 
-        logging.info(f"Creating vulnerability summary query for {center_name}")
-        query_id_vuln = create_query(url, headers, cert_path, plugin_ids, cve, "vulnipdetail")
-        data_vuln = download_analysis(url, headers, query_id_vuln, cert_path) if query_id_vuln else []
-        add_vulnsum_sheet(wb, center_name, data_vuln)
+        with safe_excel_workbook() as wb:
+            wb.remove(wb.active)
 
-    # Save workbook to unique file
-    output_file = get_unique_filename(script_dir, f"Query_Results_{cve}.xlsx")
-    wb.save(os.path.join(script_dir, output_file))
-    logging.info(f"Report saved as {output_file}")
+            # Iterate through each configured Security Center and generate reports
+            for center_name, center_info in config.items():
+                url = center_info['url']
+                access_key, secret_key = decrypt_key(fernet, center_info['encrypted_key']).split(";")
+                headers = {'x-apikey': f'accesskey={access_key}; secretkey={secret_key}', 'Content-Type': 'application/json'}
+
+                logging.info(f"Creating IP summary query for {center_name}")
+                query_id_ip = create_query(url, headers, cert_path, plugin_ids, cve, "sumip", session)
+                data_ip = download_analysis(url, headers, query_id_ip, cert_path, session) if query_id_ip else []
+                add_ip_summary_sheet(wb, center_name, data_ip)
+
+                logging.info(f"Creating vulnerability summary query for {center_name}")
+                query_id_vuln = create_query(url, headers, cert_path, plugin_ids, cve, "vulnipdetail", session)
+                data_vuln = download_analysis(url, headers, query_id_vuln, cert_path, session) if query_id_vuln else []
+                add_vulnsum_sheet(wb, center_name, data_vuln)
+
+            # Save workbook to unique file
+            output_file = get_unique_filename(script_dir, f"Query_Results_{cve}.xlsx")
+            try:
+                wb.save(os.path.join(script_dir, output_file))
+                logging.info(f"Report saved as {output_file}")
+            except PermissionError:
+                logging.error(f"Cannot save file {output_file}. It may be open in another program.")
+                sys.exit(1)
+
+    except Exception as e:
+        logging.error(f"An unexpected error occurred: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
