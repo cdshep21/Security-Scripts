@@ -127,16 +127,83 @@ Main
 PowerShell Script: Query and Download Reports with Logging
 #>
  
-[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
- 
+# Configuration
+$Config = @{
+    MaxRetries = 3
+    RetryDelay = 5
+    TimeoutSeconds = 30
+    BatchSize = 10
+    LogLevel = "INFO"  # DEBUG, INFO, WARNING, ERROR
+}
+
+# Logging function
+Function Write-Log {
+    param(
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "[$timestamp] [$Level] $Message"
+    
+    switch ($Level) {
+        "DEBUG" { if ($Config.LogLevel -in @("DEBUG")) { Write-Host $logMessage -ForegroundColor Gray } }
+        "INFO" { if ($Config.LogLevel -in @("DEBUG", "INFO")) { Write-Host $logMessage -ForegroundColor White } }
+        "WARNING" { if ($Config.LogLevel -in @("DEBUG", "INFO", "WARNING")) { Write-Host $logMessage -ForegroundColor Yellow } }
+        "ERROR" { Write-Host $logMessage -ForegroundColor Red }
+    }
+    
+    Add-Content -Path $script:LogFile -Value $logMessage
+}
+
+# Function to validate and sanitize input
+Function Test-Input {
+    param(
+        [string]$Input,
+        [string]$Type
+    )
+    switch ($Type) {
+        "Date" {
+            try {
+                $date = [DateTime]::ParseExact($Input, "yyyy-MM-dd HH:mm", $null)
+                return $true
+            } catch {
+                Write-Log "Invalid date format. Expected: YYYY-MM-DD HH:MM" -Level "ERROR"
+                return $false
+            }
+        }
+        "Url" {
+            try {
+                $uri = [System.Uri]$Input
+                return $uri.Scheme -in @("http", "https")
+            } catch {
+                Write-Log "Invalid URL format" -Level "ERROR"
+                return $false
+            }
+        }
+        "FileName" {
+            return $Input -match '^[^<>:"/\\|?*]+$'
+        }
+    }
+}
+
 # Function to load the encryption key from the environment variable
 Function Load-FernetKey {
     if (-not $Env:FERNET) {
+        Write-Log "FERNET environment variable is not set." -Level "ERROR"
         throw "FERNET environment variable is not set."
     }
-    return [Convert]::FromBase64String($Env:FERNET)
+    try {
+        $key = [Convert]::FromBase64String($Env:FERNET)
+        if ($key.Length -ne 32) {
+            throw "Invalid key length"
+        }
+        return $key
+    } catch {
+        Write-Log "Failed to load encryption key: $_" -Level "ERROR"
+        throw
+    }
 }
- 
+
 # Function to decrypt the encrypted access and secret keys
 Function Decrypt-Key {
     param (
@@ -156,22 +223,35 @@ Function Decrypt-Key {
         $plaintextBytes = $decryptor.TransformFinalBlock($ciphertext, 0, $ciphertext.Length)
         return [System.Text.Encoding]::UTF8.GetString($plaintextBytes)
     } catch {
-        throw "Failed to decrypt key: $_"
+        Write-Log "Failed to decrypt key: $_" -Level "ERROR"
+        throw
     }
 }
- 
+
 # Function to load the configuration file
 Function Load-ConfigFile {
     param (
         [string]$ConfigPath = "config.json"
     )
     if (-not (Test-Path $ConfigPath)) {
+        Write-Log "Configuration file not found: $ConfigPath" -Level "ERROR"
         throw "Configuration file not found: $ConfigPath"
     }
-    return Get-Content $ConfigPath | ConvertFrom-Json
+    try {
+        $config = Get-Content $ConfigPath | ConvertFrom-Json
+        foreach ($center in $config.PSObject.Properties) {
+            if (-not (Test-Input -Input $center.Value.url -Type "Url")) {
+                throw "Invalid URL in configuration for $($center.Name)"
+            }
+        }
+        return $config
+    } catch {
+        Write-Log "Failed to load configuration: $_" -Level "ERROR"
+        throw
+    }
 }
- 
-# Function to query Tenable using curl
+
+# Function to query Tenable using Invoke-RestMethod
 Function Query-Tenable {
     param (
         [string]$TenableUrl,
@@ -179,38 +259,52 @@ Function Query-Tenable {
         [int]$StartEpoch,
         [int]$EndEpoch
     )
-    $curlCommand = @(
-        "curl.exe",
-        "-k",
-        "-X GET",
-        "`"$TenableUrl/rest/report?fields=id,name,type,finishTime`"",
-        "-H `"x-apikey: $ApiKey`"",
-        "-H `"Content-Type: application/json`""
-    ) -join " "
- 
-#    Write-Host "Executing: $curlCommand"
-    $response = & cmd /c $curlCommand
- 
-    try {
-        $jsonResponse = $response | ConvertFrom-Json
-        $reports = $jsonResponse.response.usable
-        $filteredReports = $reports | Where-Object {
-            $_.type -in @("pdf", "csv") -and $_.finishTime -and ($_.finishTime -as [int]) -ge $StartEpoch -and ($_.finishTime -as [int]) -le $EndEpoch
+    $retryCount = 0
+    while ($retryCount -lt $Config.MaxRetries) {
+        try {
+            $headers = @{
+                "x-apikey" = $ApiKey
+                "Content-Type" = "application/json"
+            }
+            
+            $response = Invoke-RestMethod -Uri "$TenableUrl/rest/report?fields=id,name,type,finishTime" `
+                                        -Headers $headers `
+                                        -Method Get `
+                                        -TimeoutSec $Config.TimeoutSeconds `
+                                        -ErrorAction Stop
+
+            $reports = $response.response.usable
+            $filteredReports = $reports | Where-Object {
+                $_.type -in @("pdf", "csv") -and 
+                $_.finishTime -and 
+                ($_.finishTime -as [int]) -ge $StartEpoch -and 
+                ($_.finishTime -as [int]) -le $EndEpoch
+            }
+            return $filteredReports
+        } catch {
+            $retryCount++
+            if ($retryCount -eq $Config.MaxRetries) {
+                Write-Log "Failed to query Tenable after $($Config.MaxRetries) attempts: $_" -Level "ERROR"
+                throw
+            }
+            Write-Log "Query attempt $retryCount failed. Retrying in $($Config.RetryDelay) seconds..." -Level "WARNING"
+            Start-Sleep -Seconds $Config.RetryDelay
         }
-        return $filteredReports
-    } catch {
-        Write-Host "Error parsing response: $_"
-        return @()
     }
 }
- 
+
 # Function to sanitize file names
 Function Sanitize-FileName {
     param ([string]$FileName)
-    return $FileName -replace '[<>:"/\\|?*]', '_'
+    $invalidChars = [System.IO.Path]::GetInvalidFileNameChars()
+    $sanitized = $FileName
+    foreach ($char in $invalidChars) {
+        $sanitized = $sanitized.Replace($char, '_')
+    }
+    return $sanitized
 }
- 
-# Function to download a report using curl
+
+# Function to download a report using Invoke-RestMethod
 Function Download-Report {
     param (
         [Object]$Report,
@@ -222,64 +316,111 @@ Function Download-Report {
     $reportName = Sanitize-FileName -FileName $Report.name
     $fileType = $Report.type.ToLower()
     $reportPath = Join-Path $ReportsFolder "$reportName.$fileType"
- 
-    $curlCommand = @(
-        "curl.exe -k -X POST",
-        "`"$TenableUrl/rest/report/$reportId/download`"",
-        "-H `"x-apikey: $ApiKey`"",
-        "-H `"Content-Type: application/json`"",
-        "-o `"$reportPath`""
-    ) -join " "
-#    Write-Host "Executing: $curlCommand"
-& cmd /c $curlCommand
-    Write-Output "Downloaded report: $reportName.$fileType"
+    
+    $retryCount = 0
+    while ($retryCount -lt $Config.MaxRetries) {
+        try {
+            $headers = @{
+                "x-apikey" = $ApiKey
+                "Content-Type" = "application/json"
+            }
+            
+            $response = Invoke-RestMethod -Uri "$TenableUrl/rest/report/$reportId/download" `
+                                        -Headers $headers `
+                                        -Method Post `
+                                        -TimeoutSec $Config.TimeoutSeconds `
+                                        -OutFile $reportPath `
+                                        -ErrorAction Stop
+
+            # Verify file was downloaded
+            if (Test-Path $reportPath) {
+                $fileInfo = Get-Item $reportPath
+                if ($fileInfo.Length -gt 0) {
+                    Write-Log "Successfully downloaded report: $reportName.$fileType" -Level "INFO"
+                    return $true
+                }
+            }
+            throw "File download verification failed"
+        } catch {
+            $retryCount++
+            if ($retryCount -eq $Config.MaxRetries) {
+                Write-Log "Failed to download report after $($Config.MaxRetries) attempts: $_" -Level "ERROR"
+                return $false
+            }
+            Write-Log "Download attempt $retryCount failed. Retrying in $($Config.RetryDelay) seconds..." -Level "WARNING"
+            Start-Sleep -Seconds $Config.RetryDelay
+        }
+    }
+    return $false
 }
- 
+
 # Main script logic
 Function Main {
     $outputFolderName = (Get-Date -Format "yyyy-MM-dd_HH-mm") + "_Tenable-Reports"
     $outputFolder = Join-Path (Get-Location) $outputFolderName
     $reportsFolder = Join-Path $outputFolder "reports"
-    $logFile = Join-Path $outputFolder "$outputFolderName.log"
- 
-    New-Item -ItemType Directory -Path $outputFolder -Force | Out-Null
-    New-Item -ItemType Directory -Path $reportsFolder -Force | Out-Null
- 
-    Start-Transcript -Path $logFile -Append
- 
+    $script:LogFile = Join-Path $outputFolder "$outputFolderName.log"
+
     try {
+        New-Item -ItemType Directory -Path $outputFolder -Force | Out-Null
+        New-Item -ItemType Directory -Path $reportsFolder -Force | Out-Null
+
+        Write-Log "Starting Tenable Reports download process" -Level "INFO"
+        
         $fernetKey = Load-FernetKey
         $config = Load-ConfigFile
-        $startDate = Read-Host "Enter the start date (YYYY-MM-DD HH:MM)"
-        $endDate = Read-Host "Enter the end date (YYYY-MM-DD HH:MM)"
+
+        do {
+            $startDate = Read-Host "Enter the start date (YYYY-MM-DD HH:MM)"
+        } while (-not (Test-Input -Input $startDate -Type "Date"))
+
+        do {
+            $endDate = Read-Host "Enter the end date (YYYY-MM-DD HH:MM)"
+        } while (-not (Test-Input -Input $endDate -Type "Date"))
+
         $startEpoch = [DateTimeOffset]::ParseExact($startDate, "yyyy-MM-dd HH:mm", $null).ToUnixTimeSeconds()
         $endEpoch = [DateTimeOffset]::ParseExact($endDate, "yyyy-MM-dd HH:mm", $null).ToUnixTimeSeconds()
- 
+
         foreach ($centerName in $config.PSObject.Properties.Name) {
+            Write-Log "Processing Security Center: $centerName" -Level "INFO"
+            
             $centerInfo = $config.$centerName
             $tenableUrl = $centerInfo.url
             $encryptedKey = $centerInfo.encrypted_key
-            $decryptedKey = Decrypt-Key -EncryptedKey $encryptedKey
-            $keys = $decryptedKey -split ";"
-            $apiKey = "accesskey=$($keys[0]); secretkey=$($keys[1])"
- 
-            Write-Output "Querying Security Center: $centerName"
-            $reportList = Query-Tenable -TenableUrl $tenableUrl -ApiKey $apiKey -StartEpoch $startEpoch -EndEpoch $endEpoch
- 
-            if ($reportList) {
-                foreach ($report in $reportList) {
-                    Download-Report -Report $report -TenableUrl $tenableUrl -ApiKey $apiKey -ReportsFolder $reportsFolder
+            
+            try {
+                $decryptedKey = Decrypt-Key -EncryptedKey $encryptedKey
+                $keys = $decryptedKey -split ";"
+                $apiKey = "accesskey=$($keys[0]); secretkey=$($keys[1])"
+
+                $reportList = Query-Tenable -TenableUrl $tenableUrl -ApiKey $apiKey -StartEpoch $startEpoch -EndEpoch $endEpoch
+
+                if ($reportList) {
+                    $successCount = 0
+                    $failCount = 0
+                    
+                    foreach ($report in $reportList) {
+                        if (Download-Report -Report $report -TenableUrl $tenableUrl -ApiKey $apiKey -ReportsFolder $reportsFolder) {
+                            $successCount++
+                        } else {
+                            $failCount++
+                        }
+                    }
+                    
+                    Write-Log "Completed processing $centerName. Success: $successCount, Failed: $failCount" -Level "INFO"
+                } else {
+                    Write-Log "No reports found for Security Center: $centerName" -Level "WARNING"
                 }
-            } else {
-                Write-Output "No reports found for Security Center: $centerName"
+            } catch {
+                Write-Log "Error processing $centerName: $_" -Level "ERROR"
+                continue
             }
         }
     } catch {
-        Write-Output "Error: $_"
+        Write-Log "Fatal error: $_" -Level "ERROR"
     } finally {
-        Stop-Transcript
+        Write-Log "Script execution completed" -Level "INFO"
     }
 }
- 
+
 Main
- 
