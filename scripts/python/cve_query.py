@@ -208,7 +208,7 @@ def get_unique_filename(base_path, base_name):
 def main():
     script_dir = get_script_directory()
     config_path = os.path.join(script_dir, "config.json")
-    cert_path = os.path.join(script_dir, "dod_chain.crt")
+    cert_path = os.path.join(script_dir, "CA_chain.crt")
 
     if not os.path.exists(config_path) or not os.path.exists(cert_path):
         logging.error("Required config or certificate file not found.")
